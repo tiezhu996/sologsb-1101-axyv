@@ -2,6 +2,7 @@ import { defineStore } from 'pinia'
 import { computed, ref, watch } from 'vue'
 import { db, readUiPrefs, writeUiPrefs } from '@/utils/db'
 import { useIdbTable } from '@/hooks/useIdbTable'
+import { useScheduleStore } from '@/stores/scheduleStore'
 import type { Element } from '@/types/element'
 import type { Hall, HallStat } from '@/types/hall'
 import type { PaintLayer } from '@/types/layer'
@@ -21,6 +22,7 @@ export const useHallStore = defineStore('hall', () => {
   const keyword = ref('')
   const eraFilter = ref<string[]>([])
   const structureFilter = ref<string[]>([])
+  const scheduleStore = useScheduleStore()
 
   watch(currentHallId, (value) => {
     writeUiPrefs({ ...readUiPrefs(), lastHallId: value })
@@ -116,7 +118,14 @@ export const useHallStore = defineStore('hall', () => {
   }
 
   async function updateElement(id: string, patch: Partial<Element>): Promise<void> {
+    const before = await db.elements.get(id)
     await elementsTable.update(id, patch)
+    // 构件划归其它殿宇后，其下病害未完成的旧排班作废并释放占用
+    if (before && patch.hallId !== undefined && patch.hallId !== before.hallId) {
+      const layerIds = layers.value.filter((layer) => layer.elementId === id).map((layer) => layer.id)
+      const decayIds = decays.value.filter((decay) => layerIds.includes(decay.layerId)).map((decay) => decay.id)
+      await scheduleStore.voidForDecays(decayIds, '构件归属变化')
+    }
   }
 
   async function createLayer(
@@ -128,15 +137,24 @@ export const useHallStore = defineStore('hall', () => {
   }
 
   async function updateLayer(id: string, patch: Partial<PaintLayer>): Promise<void> {
+    const before = await db.layers.get(id)
     await layersTable.update(id, patch)
     const layer = layers.value.find((item) => item.id === id)
     if (layer) await syncLayerCount(layer.elementId)
+    // 层位划归其它构件后，其下病害未完成的旧排班作废并释放占用
+    if (before && patch.elementId !== undefined && patch.elementId !== before.elementId) {
+      await syncLayerCount(before.elementId)
+      const decayIds = decays.value.filter((decay) => decay.layerId === id).map((decay) => decay.id)
+      await scheduleStore.voidForDecays(decayIds, '构件归属变化')
+    }
   }
 
   async function removeLayer(id: string): Promise<void> {
     const layer = layers.value.find((item) => item.id === id)
     const decayIds = decays.value.filter((decay) => decay.layerId === id).map((decay) => decay.id)
-    await db.transaction('rw', [db.layers, db.decays, db.repairSteps], async () => {
+    await db.transaction('rw', [db.layers, db.decays, db.repairSteps, db.schedules], async () => {
+      const stepIds = await db.repairSteps.where('decayId').anyOf(decayIds).primaryKeys()
+      await db.schedules.where('stepId').anyOf(stepIds).delete()
       await db.repairSteps.where('decayId').anyOf(decayIds).delete()
       await db.decays.bulkDelete(decayIds)
       await db.layers.delete(id)
@@ -150,8 +168,10 @@ export const useHallStore = defineStore('hall', () => {
     const decayIds = decays.value.filter((decay) => layerIds.includes(decay.layerId)).map((decay) => decay.id)
     await db.transaction(
       'rw',
-      [db.elements, db.layers, db.decays, db.repairSteps],
+      [db.elements, db.layers, db.decays, db.repairSteps, db.schedules],
       async () => {
+        const stepIds = await db.repairSteps.where('decayId').anyOf(decayIds).primaryKeys()
+        await db.schedules.where('stepId').anyOf(stepIds).delete()
         await db.repairSteps.where('decayId').anyOf(decayIds).delete()
         await db.decays.bulkDelete(decayIds)
         await db.layers.bulkDelete(layerIds)
@@ -185,7 +205,7 @@ export const useHallStore = defineStore('hall', () => {
     await hallsTable.update(id, patch)
   }
 
-  /** 级联删除：殿宇 → 构件 → 层位 → 病害 → 工序 */
+  /** 级联删除：殿宇 → 构件 → 层位 → 病害 → 工序（含排班记录） */
   async function removeHall(id: string): Promise<void> {
     const elementIds = elements.value.filter((element) => element.hallId === id).map((element) => element.id)
     const layerIds = layers.value
@@ -194,8 +214,10 @@ export const useHallStore = defineStore('hall', () => {
     const decayIds = decays.value.filter((decay) => layerIds.includes(decay.layerId)).map((decay) => decay.id)
     await db.transaction(
       'rw',
-      [db.halls, db.elements, db.layers, db.decays, db.repairSteps],
+      [db.halls, db.elements, db.layers, db.decays, db.repairSteps, db.schedules],
       async () => {
+        const stepIds = await db.repairSteps.where('decayId').anyOf(decayIds).primaryKeys()
+        await db.schedules.where('stepId').anyOf(stepIds).delete()
         await db.repairSteps.where('decayId').anyOf(decayIds).delete()
         await db.decays.bulkDelete(decayIds)
         await db.layers.bulkDelete(layerIds)

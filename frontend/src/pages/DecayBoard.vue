@@ -41,11 +41,24 @@ const batchType = ref<DecayType>('起甲')
 const editDialogVisible = ref(false)
 const editingDecay = ref<Decay | null>(null)
 const editForm = ref<{
+  layerId: string
   type: DecayType
   severity: Severity
   areaCm2: number
   causeGuess: string
-}>({ type: '起甲', severity: '轻度', areaCm2: 10, causeGuess: '' })
+}>({ layerId: '', type: '起甲', severity: '轻度', areaCm2: 10, causeGuess: '' })
+
+/** 编辑病害时的「所属层位」选项：殿宇 · 构件 · 层位，改动即构件归属变化 */
+const layerOptions = computed(() =>
+  decayStore.layers.map((layer) => {
+    const element = decayStore.elements.find((item) => item.id === layer.elementId)
+    const hall = element ? hallStore.hallById(element.hallId) : undefined
+    return {
+      value: layer.id,
+      label: `${hall?.name ?? '未知殿宇'} · ${element?.name ?? '未知构件'} · 第 ${layer.level} 层 ${layer.patternName}/${layer.pigment}`
+    }
+  })
+)
 
 const filterModel = computed<FilterModel>(() => ({
   keyword: filter.value.keyword,
@@ -149,6 +162,7 @@ async function applyBatchType(): Promise<void> {
 function openEdit(row: { decay: Decay }): void {
   editingDecay.value = row.decay
   editForm.value = {
+    layerId: row.decay.layerId,
     type: row.decay.type,
     severity: row.decay.severity,
     areaCm2: row.decay.areaCm2,
@@ -160,6 +174,7 @@ function openEdit(row: { decay: Decay }): void {
 async function submitEdit(): Promise<void> {
   if (!editingDecay.value) return
   await decayStore.updateDecay(editingDecay.value.id, {
+    layerId: editForm.value.layerId,
     type: editForm.value.type,
     severity: editForm.value.severity,
     areaCm2: editForm.value.areaCm2,
@@ -385,6 +400,11 @@ const severityPalette = SEVERITY_COLOR
 
     <el-dialog v-model="editDialogVisible" title="编辑病害记录" width="540px">
       <el-form :model="editForm" label-width="110px">
+        <el-form-item label="所属层位">
+          <el-select v-model="editForm.layerId" class="full-width" filterable>
+            <el-option v-for="item in layerOptions" :key="item.value" :label="item.label" :value="item.value" />
+          </el-select>
+        </el-form-item>
         <el-form-item label="病害类型">
           <el-select v-model="editForm.type" class="full-width">
             <el-option v-for="item in typeOptionsForEdit" :key="item" :label="item" :value="item" />

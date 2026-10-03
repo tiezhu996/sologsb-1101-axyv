@@ -1,20 +1,24 @@
 <script setup lang="ts">
 import { computed, nextTick, reactive, ref, watch } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { Delete, Edit, MagicStick, Plus, Sort } from '@element-plus/icons-vue'
+import { Calendar, Delete, Edit, MagicStick, Plus, Sort } from '@element-plus/icons-vue'
 import EmptyPanel from '@/components/common/EmptyPanel.vue'
 import SeverityTag from '@/components/common/SeverityTag.vue'
 import StatBadge from '@/components/common/StatBadge.vue'
 import { useDecayStore } from '@/stores/decayStore'
 import { useHallStore } from '@/stores/hallStore'
 import { useRepairStore } from '@/stores/repairStore'
+import { useScheduleStore } from '@/stores/scheduleStore'
 import type { RepairGroup } from '@/types/repair'
 import { REPAIR_STATES, REPAIR_STEP_NAMES, type RepairState, type RepairStep, type RepairStepName } from '@/types/repair'
+import { HALF_DAYS, type HalfDay } from '@/types/schedule'
 import { formatArea } from '@/utils/severity'
+import { todayStr } from '@/utils/schedule'
 
 const hallStore = useHallStore()
 const decayStore = useDecayStore()
 const repairStore = useRepairStore()
+const scheduleStore = useScheduleStore()
 
 const hallFilter = ref<string>('')
 const stateFilter = ref<RepairState | ''>('')
@@ -65,6 +69,86 @@ const stepForm = reactive<{
 const scratchDialogVisible = ref(false)
 const scratchHallId = ref<string>('')
 const scratchTemplate = ref<RepairStepName[]>(['除尘', '回贴', '灌浆', '补绘', '封护'])
+
+/** 排班对话框：表单即草稿，写入失败时对话框保持打开、内容不清空，可直接重试 */
+const scheduleDialogVisible = ref(false)
+const scheduleSubmitting = ref(false)
+const schedulingStep = ref<RepairStep | null>(null)
+const scheduleForm = reactive<{
+  date: string
+  half: HalfDay
+  crewId: string
+  batchId: string
+  amount: number
+}>({
+  date: '',
+  half: '上午',
+  crewId: '',
+  batchId: '',
+  amount: 1
+})
+
+/** 工序的排班展示文案；无有效排班（含历史旧工序）时由模板显示「未排班」 */
+function scheduleLabel(stepId: string): string {
+  const schedule = scheduleStore.activeByStep[stepId]
+  if (!schedule) return ''
+  const crew = scheduleStore.crewById(schedule.crewId)
+  const batch = scheduleStore.batchById(schedule.batchId)
+  const batchText = batch ? `${batch.material} #${batch.batchNo}` : '批次已删除'
+  return `${schedule.date} ${schedule.half} · ${crew?.name ?? '班组已删除'} · ${batchText}（${schedule.amount} 道）`
+}
+
+function openScheduleDialog(step: RepairStep): void {
+  schedulingStep.value = step
+  const existing = scheduleStore.activeByStep[step.id]
+  scheduleForm.date = existing?.date ?? todayStr()
+  scheduleForm.half = existing?.half ?? '上午'
+  scheduleForm.crewId = existing?.crewId ?? scheduleStore.crews[0]?.id ?? ''
+  scheduleForm.batchId = existing?.batchId ?? scheduleStore.batches[0]?.id ?? ''
+  scheduleForm.amount = existing?.amount ?? 1
+  scheduleDialogVisible.value = true
+}
+
+async function submitSchedule(): Promise<void> {
+  const step = schedulingStep.value
+  if (!step) return
+  if (!scheduleForm.date) {
+    ElMessage.warning('请选择施工日期')
+    return
+  }
+  if (!scheduleForm.crewId || !scheduleForm.batchId) {
+    ElMessage.warning('请先在「排班资源」页登记班组与材料批次')
+    return
+  }
+  scheduleSubmitting.value = true
+  try {
+    const result = await scheduleStore.scheduleStep({
+      stepId: step.id,
+      date: scheduleForm.date,
+      half: scheduleForm.half,
+      crewId: scheduleForm.crewId,
+      batchId: scheduleForm.batchId,
+      amount: scheduleForm.amount
+    })
+    const slotText = `${result.schedule.date} ${result.schedule.half}`
+    if (result.deferredSlots > 0) {
+      ElMessage.success(`所选半天班组或材料批次已满，已排队顺延至 ${slotText}`)
+    } else {
+      ElMessage.success(`已排班：${slotText}`)
+    }
+    scheduleDialogVisible.value = false
+  } catch (err) {
+    // 写入失败：草稿保留在对话框中，修正后可直接再次提交
+    ElMessage.error(`排班失败：${err instanceof Error ? err.message : '本地写入异常'}；草稿已保留，可重试`)
+  } finally {
+    scheduleSubmitting.value = false
+  }
+}
+
+async function unschedule(step: RepairStep): Promise<void> {
+  await scheduleStore.unscheduleStep(step.id)
+  ElMessage.success('已取消排班，档期与材料占用已释放')
+}
 
 const hallOptions = computed(() =>
   hallStore.halls.map((hall) => ({ label: `${hall.name}（${hall.era}）`, value: hall.id }))
@@ -243,6 +327,7 @@ function handleEmptyAction(): void {
 
 const stepNameOptions = REPAIR_STEP_NAMES
 const stateOptions = REPAIR_STATES
+const halfDayOptions = HALF_DAYS
 </script>
 
 <template>
@@ -421,6 +506,13 @@ const stateOptions = REPAIR_STATES
                   @keyup.enter="commitDraft(step, 'operator')"
                 />
               </div>
+              <div class="step-card__schedule">
+                <el-icon v-if="scheduleStore.activeByStep[step.id]" class="step-card__schedule-icon"><Calendar /></el-icon>
+                <span v-if="scheduleStore.activeByStep[step.id]" class="step-card__schedule-text">
+                  {{ scheduleLabel(step.id) }}
+                </span>
+                <el-tag v-else size="small" type="info" effect="plain">未排班</el-tag>
+              </div>
             </div>
             <div class="step-card__actions">
               <el-select
@@ -431,6 +523,24 @@ const stateOptions = REPAIR_STATES
               >
                 <el-option v-for="item in stateOptions" :key="item" :label="item" :value="item" />
               </el-select>
+              <el-button
+                size="small"
+                text
+                type="primary"
+                :icon="Calendar"
+                :disabled="step.state === '已完成'"
+                @click="openScheduleDialog(step)"
+              >
+                {{ scheduleStore.activeByStep[step.id] ? '改期' : '排班' }}
+              </el-button>
+              <el-button
+                v-if="scheduleStore.activeByStep[step.id] && step.state !== '已完成'"
+                size="small"
+                text
+                @click="unschedule(step)"
+              >
+                取消排班
+              </el-button>
               <el-button size="small" text :icon="Edit" @click="openStepDialog(group.decayId, step)">编辑</el-button>
               <el-button size="small" text type="danger" @click="removeStep(step)">删除</el-button>
             </div>
@@ -480,6 +590,59 @@ const stateOptions = REPAIR_STATES
       <template #footer>
         <el-button @click="stepDialogVisible = false">取消</el-button>
         <el-button type="primary" @click="submitStep">保存</el-button>
+      </template>
+    </el-dialog>
+
+    <el-dialog v-model="scheduleDialogVisible" title="工序排班" width="540px">
+      <el-form label-width="110px">
+        <el-form-item label="施工日期">
+          <el-date-picker
+            v-model="scheduleForm.date"
+            type="date"
+            value-format="YYYY-MM-DD"
+            :clearable="false"
+            class="full-width"
+          />
+        </el-form-item>
+        <el-form-item label="半天档位">
+          <el-radio-group v-model="scheduleForm.half">
+            <el-radio-button v-for="item in halfDayOptions" :key="item" :value="item">{{ item }}</el-radio-button>
+          </el-radio-group>
+        </el-form-item>
+        <el-form-item label="施工班组">
+          <el-select v-model="scheduleForm.crewId" class="full-width" placeholder="选择班组">
+            <el-option
+              v-for="crew in scheduleStore.crews"
+              :key="crew.id"
+              :label="crew.note ? `${crew.name}（${crew.note}）` : crew.name"
+              :value="crew.id"
+            />
+          </el-select>
+        </el-form-item>
+        <el-form-item label="材料批次">
+          <el-select v-model="scheduleForm.batchId" class="full-width" placeholder="选择批次">
+            <el-option
+              v-for="batch in scheduleStore.batches"
+              :key="batch.id"
+              :label="`${batch.material} #${batch.batchNo}（${batch.capacity} 道/半天）`"
+              :value="batch.id"
+            />
+          </el-select>
+        </el-form-item>
+        <el-form-item label="占用道数">
+          <el-input-number v-model="scheduleForm.amount" :min="1" :max="99" />
+        </el-form-item>
+      </el-form>
+      <p v-if="scheduleStore.crews.length === 0 || scheduleStore.batches.length === 0" class="muted">
+        尚未登记班组或材料批次，请先到「排班资源」页维护。
+      </p>
+      <p class="muted">
+        同一班组每个半天只承接一道工序，材料批次按「道/半天」限量供应；所选半天任一条件不满足时，
+        将自动排队顺延到最近可用的半天，两项都满足才会占位。
+      </p>
+      <template #footer>
+        <el-button @click="scheduleDialogVisible = false">取消</el-button>
+        <el-button type="primary" :loading="scheduleSubmitting" @click="submitSchedule">确认排班</el-button>
       </template>
     </el-dialog>
 
@@ -653,6 +816,23 @@ const stateOptions = REPAIR_STATES
   display: flex;
   flex-wrap: wrap;
   gap: 8px;
+}
+
+.step-card__schedule {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 8px;
+  font-size: 12px;
+  color: #6b6257;
+}
+
+.step-card__schedule-icon {
+  color: #8a5a2b;
+}
+
+.step-card__schedule-text {
+  letter-spacing: 0.2px;
 }
 
 .step-card__input {

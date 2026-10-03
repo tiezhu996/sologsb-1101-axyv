@@ -6,6 +6,12 @@ import {
   stampBackupTime,
   type BackupPayload
 } from '@/utils/db'
+import { toDateStr } from '@/utils/schedule'
+
+/** 备份中的基础集合：任何版本的有效备份都必须包含 */
+const REQUIRED_COLLECTIONS = ['halls', 'elements', 'layers', 'decays', 'repairSteps'] as const
+/** v3 新增的排班集合：旧版本备份允许缺省，导入时按空数组处理 */
+const OPTIONAL_COLLECTIONS = ['crews', 'materialBatches', 'schedules'] as const
 
 /** 校验备份对象的必备字段，返回错误信息数组（为空表示通过） */
 export function validateBackup(input: unknown): { ok: boolean; errors: string[]; payload: BackupPayload | null } {
@@ -15,15 +21,11 @@ export function validateBackup(input: unknown): { ok: boolean; errors: string[];
   }
   const obj = input as Partial<BackupPayload>
   if (obj.app !== 'gbmuralarch') errors.push('app 字段应为 gbmuralarch，文件来源不明')
-  const collections: Array<keyof Pick<BackupPayload, 'halls' | 'elements' | 'layers' | 'decays' | 'repairSteps'>> = [
-    'halls',
-    'elements',
-    'layers',
-    'decays',
-    'repairSteps'
-  ]
-  for (const key of collections) {
+  for (const key of REQUIRED_COLLECTIONS) {
     if (!Array.isArray(obj[key])) errors.push(`${key} 字段缺失或不是数组`)
+  }
+  for (const key of OPTIONAL_COLLECTIONS) {
+    if (obj[key] !== undefined && !Array.isArray(obj[key])) errors.push(`${key} 字段不是数组`)
   }
   if (errors.length > 0) return { ok: false, errors, payload: null }
   const payload: BackupPayload = {
@@ -34,19 +36,25 @@ export function validateBackup(input: unknown): { ok: boolean; errors: string[];
     elements: obj.elements ?? [],
     layers: obj.layers ?? [],
     decays: obj.decays ?? [],
-    repairSteps: obj.repairSteps ?? []
+    repairSteps: obj.repairSteps ?? [],
+    crews: obj.crews ?? [],
+    materialBatches: obj.materialBatches ?? [],
+    schedules: obj.schedules ?? []
   }
   return { ok: true, errors, payload }
 }
 
 /** 组装当前本地数据的备份对象 */
 export async function buildBackupPayload(): Promise<BackupPayload> {
-  const [halls, elements, layers, decays, repairSteps] = await Promise.all([
+  const [halls, elements, layers, decays, repairSteps, crews, materialBatches, schedules] = await Promise.all([
     db.halls.toArray(),
     db.elements.toArray(),
     db.layers.toArray(),
     db.decays.toArray(),
-    db.repairSteps.toArray()
+    db.repairSteps.toArray(),
+    db.crews.toArray(),
+    db.materialBatches.toArray(),
+    db.schedules.toArray()
   ])
   return {
     app: 'gbmuralarch',
@@ -56,7 +64,10 @@ export async function buildBackupPayload(): Promise<BackupPayload> {
     elements,
     layers,
     decays,
-    repairSteps
+    repairSteps,
+    crews,
+    materialBatches,
+    schedules
   }
 }
 
@@ -81,7 +92,10 @@ export async function exportBackupJson(): Promise<{ fileName: string; counts: Re
       elements: payload.elements.length,
       layers: payload.layers.length,
       decays: payload.decays.length,
-      repairSteps: payload.repairSteps.length
+      repairSteps: payload.repairSteps.length,
+      crews: payload.crews.length,
+      materialBatches: payload.materialBatches.length,
+      schedules: payload.schedules.length
     }
   }
 }
@@ -104,13 +118,16 @@ export async function importBackup(
   if (overwrite) await clearAllTables()
   await db.transaction(
     'rw',
-    [db.halls, db.elements, db.layers, db.decays, db.repairSteps],
+    [db.halls, db.elements, db.layers, db.decays, db.repairSteps, db.crews, db.materialBatches, db.schedules],
     async () => {
       await db.halls.bulkPut(payload.halls)
       await db.elements.bulkPut(payload.elements)
       await db.layers.bulkPut(payload.layers)
       await db.decays.bulkPut(payload.decays)
       await db.repairSteps.bulkPut(payload.repairSteps)
+      await db.crews.bulkPut(payload.crews)
+      await db.materialBatches.bulkPut(payload.materialBatches)
+      await db.schedules.bulkPut(payload.schedules)
     }
   )
   return {
@@ -118,7 +135,10 @@ export async function importBackup(
     elements: payload.elements.length,
     layers: payload.layers.length,
     decays: payload.decays.length,
-    repairSteps: payload.repairSteps.length
+    repairSteps: payload.repairSteps.length,
+    crews: payload.crews.length,
+    materialBatches: payload.materialBatches.length,
+    schedules: payload.schedules.length
   }
 }
 
@@ -128,6 +148,9 @@ export function remapIds(payload: BackupPayload): BackupPayload {
   const elementIdMap = new Map<string, string>()
   const layerIdMap = new Map<string, string>()
   const decayIdMap = new Map<string, string>()
+  const stepIdMap = new Map<string, string>()
+  const crewIdMap = new Map<string, string>()
+  const batchIdMap = new Map<string, string>()
 
   const halls = payload.halls.map((hall) => {
     const id = createId('hall')
@@ -149,12 +172,29 @@ export function remapIds(payload: BackupPayload): BackupPayload {
     decayIdMap.set(decay.id, id)
     return { ...decay, id, layerId: layerIdMap.get(decay.layerId) ?? decay.layerId }
   })
-  const repairSteps = payload.repairSteps.map((step) => ({
-    ...step,
-    id: createId('step'),
-    decayId: decayIdMap.get(step.decayId) ?? step.decayId
+  const repairSteps = payload.repairSteps.map((step) => {
+    const id = createId('step')
+    stepIdMap.set(step.id, id)
+    return { ...step, id, decayId: decayIdMap.get(step.decayId) ?? step.decayId }
+  })
+  const crews = payload.crews.map((crew) => {
+    const id = createId('crew')
+    crewIdMap.set(crew.id, id)
+    return { ...crew, id }
+  })
+  const materialBatches = payload.materialBatches.map((batch) => {
+    const id = createId('batch')
+    batchIdMap.set(batch.id, id)
+    return { ...batch, id }
+  })
+  const schedules = payload.schedules.map((schedule) => ({
+    ...schedule,
+    id: createId('sch'),
+    stepId: stepIdMap.get(schedule.stepId) ?? schedule.stepId,
+    crewId: crewIdMap.get(schedule.crewId) ?? schedule.crewId,
+    batchId: batchIdMap.get(schedule.batchId) ?? schedule.batchId
   }))
-  return { ...payload, halls, elements, layers, decays, repairSteps }
+  return { ...payload, halls, elements, layers, decays, repairSteps, crews, materialBatches, schedules }
 }
 
 /** 生成演示样例数据，便于首次打开即可看到完整链路 */
@@ -164,10 +204,17 @@ export async function seedDemoData(): Promise<void> {
   const elementIds = [createId('elem'), createId('elem')]
   const layerIds = elementIds.map(() => createId('lay'))
   const decayIds = layerIds.map(() => createId('dec'))
+  const stepIds = [createId('step'), createId('step')]
+  const crewIds = [createId('crew'), createId('crew')]
+  const batchIds = [createId('batch'), createId('batch')]
+  const yesterday = new Date()
+  yesterday.setDate(yesterday.getDate() - 1)
+  const tomorrow = new Date()
+  tomorrow.setDate(tomorrow.getDate() + 1)
 
   await db.transaction(
     'rw',
-    [db.halls, db.elements, db.layers, db.decays, db.repairSteps],
+    [db.halls, db.elements, db.layers, db.decays, db.repairSteps, db.crews, db.materialBatches, db.schedules],
     async () => {
       await db.halls.put({
         id: hallId,
@@ -252,7 +299,7 @@ export async function seedDemoData(): Promise<void> {
       ])
       await db.repairSteps.bulkPut([
         {
-          id: createId('step'),
+          id: stepIds[0],
           decayId: decayIds[0],
           seq: 1,
           name: '除尘',
@@ -263,13 +310,49 @@ export async function seedDemoData(): Promise<void> {
           updatedAt: now
         },
         {
-          id: createId('step'),
+          id: stepIds[1],
           decayId: decayIds[0],
           seq: 2,
           name: '回贴',
           material: '鱼鳔胶（2% 明矾水调和）',
           operator: '李文博',
           state: '进行中',
+          createdAt: now,
+          updatedAt: now
+        }
+      ])
+      await db.crews.bulkPut([
+        { id: crewIds[0], name: '李文博组', note: '除尘 / 回贴', createdAt: now, updatedAt: now },
+        { id: crewIds[1], name: '王守拙组', note: '灌浆 / 补绘 / 封护', createdAt: now, updatedAt: now }
+      ])
+      await db.materialBatches.bulkPut([
+        { id: batchIds[0], material: '鱼鳔胶', batchNo: 'A-01', capacity: 2, createdAt: now, updatedAt: now },
+        { id: batchIds[1], material: '去离子水', batchNo: 'B-03', capacity: 1, createdAt: now, updatedAt: now }
+      ])
+      await db.schedules.bulkPut([
+        {
+          id: createId('sch'),
+          stepId: stepIds[0],
+          date: toDateStr(yesterday),
+          half: '上午',
+          crewId: crewIds[0],
+          batchId: batchIds[1],
+          amount: 1,
+          state: '有效',
+          voidReason: '',
+          createdAt: now,
+          updatedAt: now
+        },
+        {
+          id: createId('sch'),
+          stepId: stepIds[1],
+          date: toDateStr(tomorrow),
+          half: '上午',
+          crewId: crewIds[0],
+          batchId: batchIds[0],
+          amount: 1,
+          state: '有效',
+          voidReason: '',
           createdAt: now,
           updatedAt: now
         }

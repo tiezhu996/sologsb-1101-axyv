@@ -2,6 +2,7 @@ import { defineStore } from 'pinia'
 import { computed, reactive, ref } from 'vue'
 import { db } from '@/utils/db'
 import { useIdbTable } from '@/hooks/useIdbTable'
+import { useScheduleStore } from '@/stores/scheduleStore'
 import {
   createEmptyDecayFilter,
   type Decay,
@@ -29,6 +30,7 @@ export const useDecayStore = defineStore('decay', () => {
   const decaysTable = useIdbTable<Decay>((database) => database.decays)
   const layersTable = useIdbTable<PaintLayer>((database) => database.layers, { sortByUpdatedAt: false })
   const elementsTable = useIdbTable<Element>((database) => database.elements, { sortByUpdatedAt: false })
+  const scheduleStore = useScheduleStore()
 
   const filter = ref<DecayFilterState>(createEmptyDecayFilter())
   const selectedIds = reactive<Set<string>>(new Set<string>())
@@ -175,19 +177,30 @@ export const useDecayStore = defineStore('decay', () => {
   }
 
   async function updateDecay(id: string, patch: Partial<Decay>): Promise<void> {
+    const before = await db.decays.get(id)
     await decaysTable.update(id, patch)
+    if (!before) return
+    // 病害程度或构件归属变化后，未完成的旧排班作废并释放占用（已完成的施工记录保留）
+    const reasons: string[] = []
+    if (patch.severity !== undefined && patch.severity !== before.severity) reasons.push('病害程度变化')
+    if (patch.layerId !== undefined && patch.layerId !== before.layerId) reasons.push('构件归属变化')
+    if (reasons.length > 0) await scheduleStore.voidForDecays([id], reasons.join('、'))
   }
 
   async function removeDecay(id: string): Promise<void> {
-    await db.transaction('rw', [db.decays, db.repairSteps], async () => {
+    await db.transaction('rw', [db.decays, db.repairSteps, db.schedules], async () => {
+      const stepIds = await db.repairSteps.where('decayId').equals(id).primaryKeys()
+      await db.schedules.where('stepId').anyOf(stepIds).delete()
       await db.repairSteps.where('decayId').equals(id).delete()
       await db.decays.delete(id)
     })
     selectedIds.delete(id)
   }
 
-  /** 批量改严重程度（档案台批量操作） */
+  /** 批量改严重程度（档案台批量操作）；程度实际变化的病害，其未完成排班作废 */
   async function bulkSetSeverity(ids: string[], severity: Severity): Promise<number> {
+    const before = await db.decays.where('id').anyOf(ids).toArray()
+    const changedIds = before.filter((decay) => decay.severity !== severity).map((decay) => decay.id)
     const now = Date.now()
     await db.decays
       .where('id')
@@ -196,6 +209,7 @@ export const useDecayStore = defineStore('decay', () => {
         decay.severity = severity
         decay.updatedAt = now
       })
+    if (changedIds.length > 0) await scheduleStore.voidForDecays(changedIds, '病害程度变化')
     return ids.length
   }
 

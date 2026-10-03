@@ -4,6 +4,7 @@ import { db, readUiPrefs, writeUiPrefs } from '@/utils/db'
 import { useIdbTable } from '@/hooks/useIdbTable'
 import { useDecayStore } from '@/stores/decayStore'
 import { useHallStore } from '@/stores/hallStore'
+import { useScheduleStore } from '@/stores/scheduleStore'
 import type { Decay } from '@/types/decay'
 import type { Element } from '@/types/element'
 import type { Hall } from '@/types/hall'
@@ -17,6 +18,7 @@ export const useRepairStore = defineStore('repair', () => {
   const repairTable = useIdbTable<RepairStep>((database) => database.repairSteps)
   const decayStore = useDecayStore()
   const hallStore = useHallStore()
+  const scheduleStore = useScheduleStore()
 
   const sortMode = ref<'manual' | 'severity'>(readUiPrefs().repairSort)
   const activeDecayId = ref<string | null>(null)
@@ -139,18 +141,26 @@ export const useRepairStore = defineStore('repair', () => {
   async function removeStep(id: string): Promise<void> {
     const step = steps.value.find((item) => item.id === id)
     if (!step) return
-    await repairTable.remove(id)
+    await db.transaction('rw', [db.repairSteps, db.schedules], async () => {
+      await db.schedules.where('stepId').equals(id).delete()
+      await db.repairSteps.delete(id)
+    })
     await normalizeSeq(step.decayId)
+    // 删除工序后剩余工序顺次重排，未完成的旧排班随之作废
+    await scheduleStore.voidForDecays([step.decayId], '工序顺序变化')
     await syncDecayState(step.decayId)
   }
 
   async function removeGroup(decayId: string): Promise<void> {
     const ids = steps.value.filter((step) => step.decayId === decayId).map((step) => step.id)
-    await repairTable.bulkRemove(ids)
+    await db.transaction('rw', [db.repairSteps, db.schedules], async () => {
+      await db.schedules.where('stepId').anyOf(ids).delete()
+      await db.repairSteps.bulkDelete(ids)
+    })
     await syncDecayState(decayId)
   }
 
-  /** 拖拽后按新顺序批量回写 seq */
+  /** 拖拽后按新顺序批量回写 seq；顺序变化后未完成的旧排班作废并释放占用 */
   async function reorder(decayId: string, orderedIds: string[]): Promise<void> {
     const now = Date.now()
     await db.transaction('rw', db.repairSteps, async () => {
@@ -167,6 +177,7 @@ export const useRepairStore = defineStore('repair', () => {
         })
       }
     })
+    await scheduleStore.voidForDecays([decayId], '工序顺序变化')
   }
 
   async function setStepState(id: string, state: RepairState): Promise<void> {

@@ -2,7 +2,7 @@
 
 面向文物建筑彩画勘察与修复人员的本地化档案工具：把殿宇内每处彩画层位的病害现状逐条落档，并按工序安排修复先后。
 
-核心动作：**录入殿宇与构件 → 圈定彩画层位 → 判定病害类型与程度 → 挂接修复工序并跟踪进度**。
+核心动作：**录入殿宇与构件 → 圈定彩画层位 → 判定病害类型与程度 → 挂接修复工序并跟踪进度 → 按班组档期与材料批次排班施工**。
 
 纯前端单页应用（Vue 3 + TypeScript + Element Plus + Vite + Pinia + Vue Router），**无后端、无数据库服务、无 API 服务**，全部数据保存在浏览器本地（IndexedDB / Dexie + 少量 localStorage 元数据），刷新或重启浏览器后仍然存在。
 
@@ -69,8 +69,9 @@ npm run preview    # 本地预览构建产物（http://localhost:21801）
 | --- | --- | --- | --- |
 | `/halls` | 殿宇总览 | 新建殿宇、按年代与结构类型筛选，卡片回显病害总数与未修复数 | Hall、Element、PaintLayer、Decay |
 | `/halls/:id/elements` | 构件与层位 | 构件树 + 层位表格，新增构件与层位，挂接病害 | Element、PaintLayer、Decay |
-| `/decays` | 病害档案台 | 按类型 / 程度 / 颜料 / 殿宇 / 部位组合筛选，批量改严重程度与类型 | Decay、PaintLayer |
-| `/repair` | 修复工序时间线 | 拖拽调整工序先后，回填材料与责任人，完成即回写病害为已修复 | RepairStep、Decay |
+| `/decays` | 病害档案台 | 按类型 / 程度 / 颜料 / 殿宇 / 部位组合筛选，批量改严重程度与类型，编辑病害可改所属层位 | Decay、PaintLayer |
+| `/repair` | 修复工序时间线 | 拖拽调整工序先后，回填材料与责任人，完成即回写病害为已修复；按班组与材料批次为工序排班 | RepairStep、Decay、Schedule |
+| `/schedule` | 排班资源 | 登记班组与材料批次，查看未来 7 天班组档期与批次占用，追溯已作废排班 | Crew、MaterialBatch、Schedule |
 | `/backup` | 本地数据与备份 | 查看本地结构版本、JSON 导入导出、清空与样例数据 | 全部模型 |
 
 `/` 与未匹配路径均重定向到 `/halls`。
@@ -86,8 +87,18 @@ npm run preview    # 本地预览构建产物（http://localhost:21801）
 | PaintLayer 彩画层位 | `src/types/layer.ts` | `id` `elementId` `level`（由外至内） `patternName`（旋子/和玺/苏式） `pigment`（石青/石绿/朱砂/土黄） `thicknessMm` | 层位顺次叠压 |
 | Decay 病害记录 | `src/types/decay.ts` | `id` `layerId` `type`（起甲/剥落/空鼓/粉化/龟裂） `severity`（轻度/中度/重度） `areaCm2` `causeGuess` `repaired` | 同层位可叠加多条并汇总到殿宇 |
 | RepairStep 修复工序 | `src/types/repair.ts` | `id` `decayId` `seq` `name`（除尘/回贴/灌浆/补绘/封护） `material` `operator` `state`（未开始/进行中/已完成） | 拖拽排序，完成回写病害 |
+| Crew 施工班组 | `src/types/schedule.ts` | `id` `name` `note` | 同一班组每个半天只承接一道工序 |
+| MaterialBatch 材料批次 | `src/types/schedule.ts` | `id` `material` `batchNo` `capacity`（道/半天） | 容量按每半天可供应的工序道数计量 |
+| Schedule 排班记录 | `src/types/schedule.ts` | `id` `stepId` `date` `half`（上午/下午） `crewId` `batchId` `amount` `state`（有效/已作废） `voidReason` | 作废后释放占用，记录保留备查 |
 
-数据结构版本号 `DB_VERSION` 定义在 `src/utils/db.ts`，当前为 `v2`：`decays` 表补充 `repairedAt` 索引，并为修复状态缺失的历史数据按 `updatedAt` 回填，升级逻辑写在 Dexie 的 `.upgrade()` 中。
+数据结构版本号 `DB_VERSION` 定义在 `src/utils/db.ts`，当前为 `v3`：新增 `crews` / `materialBatches` / `schedules` 三张排班表；既有工序没有排班记录，在修复工序页按「未排班」展示。历史迁移：`v1 → v2` 为 `decays` 表补充 `repairedAt` 索引，并为修复状态缺失的历史数据按 `updatedAt` 回填，升级逻辑写在 Dexie 的 `.upgrade()` 中。
+
+### 排班规则
+
+- **两项都满足才占位**：同一班组同一半天最多一道工序；同一材料批次同一半天的已占道数不超过其供应能力（道/半天）。
+- **排队顺延**：所选半天任一条件不满足时，自动顺延到最近可同时满足两项条件的半天占位。
+- **原子写入**：改期时作废旧排班与写入新排班在同一个 IndexedDB 事务内完成，不会留下半截占用；瞬时写入失败自动重试，仍失败则界面保留排班草稿，可修正后再次提交。
+- **自动作废**：病害程度、工序顺序或构件（层位）归属变化后，相关病害下「未完成」工序的有效排班自动作废并释放占用；已完成工序的排班即施工记录，原样保留。
 
 ---
 
@@ -97,13 +108,13 @@ npm run preview    # 本地预览构建产物（http://localhost:21801）
 sologsb-1101/
 ├── frontend/                     # 前端源码
 │   ├── src/
-│   │   ├── types/                # hall.ts element.ts layer.ts decay.ts repair.ts
-│   │   ├── stores/               # hallStore.ts decayStore.ts repairStore.ts
+│   │   ├── types/                # hall.ts element.ts layer.ts decay.ts repair.ts schedule.ts
+│   │   ├── stores/               # hallStore.ts decayStore.ts repairStore.ts scheduleStore.ts
 │   │   ├── components/common/    # SeverityTag.vue FilterBar.vue StatBadge.vue EmptyPanel.vue
 │   │   ├── hooks/                # useDecayFilter.ts useIdbTable.ts
-│   │   ├── pages/                # HallList.vue ElementDetail.vue DecayBoard.vue RepairPlan.vue BackupView.vue
+│   │   ├── pages/                # HallList.vue ElementDetail.vue DecayBoard.vue RepairPlan.vue ScheduleBoard.vue BackupView.vue
 │   │   ├── router/               # index.ts
-│   │   ├── utils/                # severity.ts db.ts export.ts
+│   │   ├── utils/                # severity.ts db.ts export.ts schedule.ts
 │   │   ├── styles/               # main.css
 │   │   ├── App.vue main.ts env.d.ts
 │   ├── public/favicon.svg
@@ -122,9 +133,9 @@ sologsb-1101/
 
 ## 七、数据存储说明
 
-- **IndexedDB（Dexie，数据库名 `gbmuralarch`）**：5 张业务表 `halls` / `elements` / `layers` / `decays` / `repairSteps`，由 `src/utils/db.ts` 统一定义 schema、版本号与升级迁移；所有增删改查通过 `src/hooks/useIdbTable.ts` 封装，并用 `liveQuery` 提供响应式订阅。
+- **IndexedDB（Dexie，数据库名 `gbmuralarch`）**：8 张业务表 `halls` / `elements` / `layers` / `decays` / `repairSteps` / `crews` / `materialBatches` / `schedules`，由 `src/utils/db.ts` 统一定义 schema、版本号与升级迁移；所有增删改查通过 `src/hooks/useIdbTable.ts` 封装，并用 `liveQuery` 提供响应式订阅。
 - **localStorage**：仅存元数据 —— `gbmuralarch:db-version`（本地结构版本）、`gbmuralarch:last-backup-at`（最近一次导出时间）、`gbmuralarch:ui-prefs`（当前选中殿宇、工序排序方式）。
-- **备份**：`/backup` 页面可导出 JSON（含 5 张表全量数据与结构版本），导入时先校验 `app` 字段与各集合数组完整性；支持「覆盖导入」与「追加导入（重新分配 id）」两种模式。
+- **备份**：`/backup` 页面可导出 JSON（含 8 张表全量数据与结构版本），导入时先校验 `app` 字段与各集合数组完整性（v3 新增的排班集合对旧备份宽容缺省）；支持「覆盖导入」与「追加导入（重新分配 id）」两种模式。
 - **隐私与无状态**：数据不上传任何服务器，容器不挂载命名卷；清理浏览器站点数据或更换浏览器会丢失档案，请定期导出备份。
 
 ---
