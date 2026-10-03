@@ -4,6 +4,8 @@ import { db, readUiPrefs, writeUiPrefs } from '@/utils/db'
 import { useIdbTable } from '@/hooks/useIdbTable'
 import { useDecayStore } from '@/stores/decayStore'
 import { useHallStore } from '@/stores/hallStore'
+import { useScheduleStore } from '@/stores/scheduleStore'
+import { scheduleBus } from '@/utils/scheduleBus'
 import type { Decay } from '@/types/decay'
 import type { Element } from '@/types/element'
 import type { Hall } from '@/types/hall'
@@ -17,6 +19,10 @@ export const useRepairStore = defineStore('repair', () => {
   const repairTable = useIdbTable<RepairStep>((database) => database.repairSteps)
   const decayStore = useDecayStore()
   const hallStore = useHallStore()
+  // 延迟取排班 store：完成态需要把占用台账同步为「已施工 / 已排班」
+  function schedule() {
+    return useScheduleStore()
+  }
 
   const sortMode = ref<'manual' | 'severity'>(readUiPrefs().repairSort)
   const activeDecayId = ref<string | null>(null)
@@ -139,18 +145,32 @@ export const useRepairStore = defineStore('repair', () => {
   async function removeStep(id: string): Promise<void> {
     const step = steps.value.find((item) => item.id === id)
     if (!step) return
-    await repairTable.remove(id)
+    // 只有删除位置之后还有工序时，剩余工序的先后才真正变化（需要作废旧排班）
+    const hadSuccessor = steps.value.some(
+      (item) => item.decayId === step.decayId && item.seq > step.seq
+    )
+    // 工序删除与排班台账清理在同一事务内完成，避免留下孤儿占用
+    await db.transaction('rw', [db.repairSteps, db.scheduleAllocations], async () => {
+      await db.scheduleAllocations.where('stepId').equals(id).delete()
+      await db.repairSteps.delete(id)
+    })
     await normalizeSeq(step.decayId)
     await syncDecayState(step.decayId)
+    if (hadSuccessor) {
+      scheduleBus.emit('steps:reordered', { decayIds: [step.decayId] })
+    }
   }
 
   async function removeGroup(decayId: string): Promise<void> {
     const ids = steps.value.filter((step) => step.decayId === decayId).map((step) => step.id)
-    await repairTable.bulkRemove(ids)
+    await db.transaction('rw', [db.repairSteps, db.scheduleAllocations], async () => {
+      if (ids.length > 0) await db.scheduleAllocations.where('stepId').anyOf(ids).delete()
+      await db.repairSteps.where('decayId').equals(decayId).delete()
+    })
     await syncDecayState(decayId)
   }
 
-  /** 拖拽后按新顺序批量回写 seq */
+  /** 拖拽后按新顺序批量回写 seq，并作废未完成的旧排班（完成记录保留） */
   async function reorder(decayId: string, orderedIds: string[]): Promise<void> {
     const now = Date.now()
     await db.transaction('rw', db.repairSteps, async () => {
@@ -167,12 +187,15 @@ export const useRepairStore = defineStore('repair', () => {
         })
       }
     })
+    scheduleBus.emit('steps:reordered', { decayIds: [decayId] })
   }
 
   async function setStepState(id: string, state: RepairState): Promise<void> {
     const step = steps.value.find((item) => item.id === id)
     if (!step) return
     await repairTable.update(id, { state })
+    // 排班占用随完成态流转：完成 → 已施工（保留）；改回 → 继续占位
+    await schedule().syncStepState(id, state)
     await syncDecayState(step.decayId)
   }
 

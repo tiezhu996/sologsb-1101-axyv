@@ -1,20 +1,26 @@
 <script setup lang="ts">
 import { computed, nextTick, reactive, ref, watch } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { Delete, Edit, MagicStick, Plus, Sort } from '@element-plus/icons-vue'
+import { Calendar, Delete, Edit, MagicStick, Plus, Sort, Timer } from '@element-plus/icons-vue'
 import EmptyPanel from '@/components/common/EmptyPanel.vue'
 import SeverityTag from '@/components/common/SeverityTag.vue'
 import StatBadge from '@/components/common/StatBadge.vue'
 import { useDecayStore } from '@/stores/decayStore'
 import { useHallStore } from '@/stores/hallStore'
 import { useRepairStore } from '@/stores/repairStore'
+import { useScheduleStore } from '@/stores/scheduleStore'
+import { ScheduleConstraintError } from '@/stores/scheduleStore'
 import type { RepairGroup } from '@/types/repair'
 import { REPAIR_STATES, REPAIR_STEP_NAMES, type RepairState, type RepairStep, type RepairStepName } from '@/types/repair'
+import type { ScheduleAllocation } from '@/types/schedule'
+import { HALF_DAYS, HALF_DAY_LABEL, type HalfDay, type MaterialBatch } from '@/types/resource'
+import { datePickerToKey, formatSlot, todayKey } from '@/utils/date'
 import { formatArea } from '@/utils/severity'
 
 const hallStore = useHallStore()
 const decayStore = useDecayStore()
 const repairStore = useRepairStore()
+const scheduleStore = useScheduleStore()
 
 const hallFilter = ref<string>('')
 const stateFilter = ref<RepairState | ''>('')
@@ -65,6 +71,262 @@ const stepForm = reactive<{
 const scratchDialogVisible = ref(false)
 const scratchHallId = ref<string>('')
 const scratchTemplate = ref<RepairStepName[]>(['除尘', '回贴', '灌浆', '补绘', '封护'])
+
+// --------------------------------------------------------------- 排班弹窗
+
+type BatchMode = 'auto' | 'manual' | 'none'
+
+const scheduleDialogVisible = ref(false)
+const scheduling = ref(false)
+const scheduleTarget = ref<RepairStep | null>(null)
+/** 排班草稿：保存失败（事务回滚 / 写入异常）时弹窗与草稿都保留，可直接重试 */
+const scheduleForm = reactive<{
+  crewId: string
+  startDate: string | Date
+  preferredSlot: HalfDay | null
+  batchMode: BatchMode
+  batchId: string
+  qty: number
+}>({
+  crewId: '',
+  startDate: todayKey(),
+  preferredSlot: 'AM',
+  batchMode: 'auto',
+  batchId: '',
+  qty: 1
+})
+
+const groupScheduleVisible = ref(false)
+const groupScheduling = ref(false)
+const groupScheduleTarget = ref<RepairGroup | null>(null)
+const groupForm = reactive<{ crewId: string; startDate: string | Date; preferredSlot: HalfDay | null }>({
+  crewId: '',
+  startDate: todayKey(),
+  preferredSlot: 'AM'
+})
+/** 整组排班每道工序的材料用量草稿（null = 不占材料） */
+const groupQtyDrafts = reactive<Record<string, number | null>>({})
+
+const crewOptions = computed(() =>
+  scheduleStore.crews
+    .filter((crew) => !crew.archived)
+    .map((crew) => ({ label: `${crew.name}（${crew.trade || '未分工种'}）`, value: crew.id }))
+)
+
+const matchingBatches = computed<MaterialBatch[]>(() => {
+  const step = scheduleTarget.value
+  if (!step || !step.material.trim()) return []
+  return scheduleStore.batchesForMaterial(step.material)
+})
+
+function openSchedule(step: RepairStep): void {
+  if (step.state === '已完成') {
+    ElMessage.info('该工序已完成，施工记录保留，不能再改排')
+    return
+  }
+  scheduleTarget.value = step
+  const existing = scheduleStore.activeAllocationOf(step.id)
+  scheduleForm.crewId = existing?.crewId ?? crewOptions.value[0]?.value ?? ''
+  scheduleForm.startDate = existing?.date ?? todayKey()
+  scheduleForm.preferredSlot = existing?.slot ?? 'AM'
+  scheduleForm.qty = existing?.qty ?? 1
+  if (existing?.batchId) {
+    scheduleForm.batchMode = 'manual'
+    scheduleForm.batchId = existing.batchId
+  } else if (step.material.trim() && scheduleStore.batchesForMaterial(step.material).length > 0) {
+    scheduleForm.batchMode = 'auto'
+    scheduleForm.batchId = ''
+  } else {
+    scheduleForm.batchMode = step.material.trim() ? 'auto' : 'none'
+    scheduleForm.batchId = ''
+  }
+  scheduleDialogVisible.value = true
+}
+
+function wait(ms: number): Promise<void> {
+  return new Promise((resolve) => window.setTimeout(resolve, ms))
+}
+
+/**
+ * 提交排班：班组档期 + 材料容量的占位在同一个 Dexie 事务内完成。
+ * 业务约束冲突（班组撞档 / 容量不足）直接提示，用户改草稿后重试；
+ * 其它写入异常自动重试一次；无论哪种失败，事务回滚且草稿保留，不产生半截占用。
+ */
+async function submitSchedule(): Promise<void> {
+  const step = scheduleTarget.value
+  if (!step) return
+  if (!scheduleForm.crewId) {
+    ElMessage.warning('请选择施工班组')
+    return
+  }
+  if (scheduleForm.batchMode === 'manual' && !scheduleForm.batchId) {
+    ElMessage.warning('请选择材料批次，或改为自动匹配 / 不占材料')
+    return
+  }
+  if (scheduling.value) return
+  const input = {
+    stepId: step.id,
+    crewId: scheduleForm.crewId,
+    startDate: datePickerToKey(scheduleForm.startDate),
+    preferredSlot: scheduleForm.preferredSlot,
+    batchId:
+      scheduleForm.batchMode === 'none'
+        ? null
+        : scheduleForm.batchMode === 'auto'
+          ? 'auto'
+          : scheduleForm.batchId,
+    qty: scheduleForm.qty
+  }
+  scheduling.value = true
+  try {
+    const result = await scheduleStore.scheduleStep(input)
+    scheduleDialogVisible.value = false
+    const batchText = result.batch ? `，占用批次「${result.batch.batchNo}」${result.allocation.qty}` : ''
+    ElMessage.success(`已占位：${formatSlot(result.date, result.slot)}${batchText}`)
+  } catch (err) {
+    if (err instanceof ScheduleConstraintError) {
+      ElMessage.error(err.message)
+    } else {
+      // 写入类异常（如浏览器事务中断）：短暂等待后自动重试一次，草稿依旧保留
+      try {
+        await wait(400)
+        const result = await scheduleStore.scheduleStep(input)
+        scheduleDialogVisible.value = false
+        ElMessage.success(`重试成功，已占位：${formatSlot(result.date, result.slot)}`)
+      } catch (retryErr) {
+        ElMessage.error(
+          `排班写入失败，已自动回滚未留下半截占用，可修改后重试：${
+            retryErr instanceof Error ? retryErr.message : '未知错误'
+          }`
+        )
+      }
+    }
+  } finally {
+    scheduling.value = false
+  }
+}
+
+async function cancelSchedule(step: RepairStep): Promise<void> {
+  const confirmed = await ElMessageBox.confirm(
+    `取消「${step.name}」的排班？班组档期与材料容量会立即释放，记录保留为已作废。`,
+    '取消排班',
+    { type: 'warning' }
+  ).catch(() => false)
+  if (!confirmed) return
+  await scheduleStore.cancelByStep(step.id)
+  ElMessage.success('排班已作废并释放占用')
+}
+
+// --------------------------------------------------------------- 整组排班
+
+function openGroupSchedule(group: RepairGroup): void {
+  const pending = group.steps.filter((step) => {
+    if (step.state === '已完成') return false
+    return !scheduleStore.activeAllocationOf(step.id)
+  })
+  if (pending.length === 0) {
+    ElMessage.info('该组未完成工序都已有排班；如需调整请逐道改排')
+    return
+  }
+  groupScheduleTarget.value = group
+  groupForm.crewId = crewOptions.value[0]?.value ?? ''
+  groupForm.startDate = todayKey()
+  groupForm.preferredSlot = 'AM'
+  Object.keys(groupQtyDrafts).forEach((key) => delete groupQtyDrafts[key])
+  pending.forEach((step) => {
+    // 默认按工序材料名自动匹配批次，用量 1；材料为空的工序默认不占材料
+    groupQtyDrafts[step.id] = step.material.trim() ? 1 : null
+  })
+  groupScheduleVisible.value = true
+}
+
+const groupDraftSteps = computed(() =>
+  groupScheduleTarget.value
+    ? groupScheduleTarget.value.steps.filter(
+        (step) => step.state !== '已完成' && !scheduleStore.activeAllocationOf(step.id)
+      )
+    : []
+)
+
+async function submitGroupSchedule(): Promise<void> {
+  const group = groupScheduleTarget.value
+  if (!group) return
+  if (!groupForm.crewId) {
+    ElMessage.warning('请选择施工班组')
+    return
+  }
+  if (groupScheduling.value) return
+  const items = groupDraftSteps.value.map((step) => ({
+    stepId: step.id,
+    qty: groupQtyDrafts[step.id] ?? null
+  }))
+  groupScheduling.value = true
+  try {
+    const results = await scheduleStore.scheduleGroup({
+      decayId: group.decayId,
+      crewId: groupForm.crewId,
+      startDate: datePickerToKey(groupForm.startDate),
+      preferredSlot: groupForm.preferredSlot,
+      items
+    })
+    groupScheduleVisible.value = false
+    ElMessage.success(`已连续占位 ${results.length} 道工序，首道：${formatSlot(results[0].date, results[0].slot)}`)
+  } catch (err) {
+    if (err instanceof ScheduleConstraintError) {
+      ElMessage.error(`${err.message}；本次整组排班已整体回滚，未留下半截占用`)
+    } else {
+      ElMessage.error(`整组排班写入失败，已回滚：${err instanceof Error ? err.message : '未知错误'}`)
+    }
+  } finally {
+    groupScheduling.value = false
+  }
+}
+
+// --------------------------------------------------------------- 回显
+
+interface AllocationView {
+  allocation: ScheduleAllocation
+  label: string
+  crewName: string
+  batchText: string
+  tone: 'success' | 'warning' | 'info' | 'danger'
+  text: string
+}
+
+function allocationView(step: RepairStep): AllocationView | null {
+  const allocation = scheduleStore.latestAllocationOf(step.id)
+  if (!allocation) return null
+  const crew = scheduleStore.crewById(allocation.crewId)
+  const batch = allocation.batchId ? scheduleStore.batchById(allocation.batchId) : undefined
+  if (allocation.state === 'done') {
+    return {
+      allocation,
+      label: '已施工',
+      tone: 'success',
+      text: formatSlot(allocation.date, allocation.slot),
+      crewName: crew?.name ?? '班组已删除',
+      batchText: batch ? `${batch.materialName} · ${batch.batchNo} × ${allocation.qty}` : '不占材料'
+    }
+  }
+  if (allocation.state === 'scheduled') {
+    return {
+      allocation,
+      label: '已排班',
+      tone: 'warning',
+      text: formatSlot(allocation.date, allocation.slot),
+      crewName: crew?.name ?? '班组已删除',
+      batchText: batch ? `${batch.materialName} · ${batch.batchNo} × ${allocation.qty}` : '不占材料'
+    }
+  }
+  return {
+    allocation,
+    label: '已作废',
+    tone: 'info',
+    text: allocation.voidReason ? `原排班已作废：${allocation.voidReason}` : '原排班已作废',
+    crewName: '',
+    batchText: ''
+  }
+}
 
 const hallOptions = computed(() =>
   hallStore.halls.map((hall) => ({ label: `${hall.name}（${hall.era}）`, value: hall.id }))
@@ -163,9 +425,9 @@ async function submitStep(): Promise<void> {
 }
 
 async function removeStep(step: RepairStep): Promise<void> {
-  const confirmed = await ElMessageBox.confirm(`删除工序「${step.name}」？`, '删除确认', { type: 'warning' }).catch(
-    () => false
-  )
+  const confirmed = await ElMessageBox.confirm(`删除工序「${step.name}」？相关排班占用会一并释放或清理。`, '删除确认', {
+    type: 'warning'
+  }).catch(() => false)
   if (!confirmed) return
   await repairStore.removeStep(step.id)
   ElMessage.success('工序已删除')
@@ -173,7 +435,7 @@ async function removeStep(step: RepairStep): Promise<void> {
 
 async function removeGroup(group: RepairGroup): Promise<void> {
   const confirmed = await ElMessageBox.confirm(
-    `清空「${groupTitle(group)}」的全部 ${group.steps.length} 道工序？`,
+    `清空「${groupTitle(group)}」的全部 ${group.steps.length} 道工序？班组档期与材料占用会随之释放。`,
     '删除确认',
     { type: 'warning' }
   ).catch(() => false)
@@ -186,7 +448,7 @@ async function changeState(step: RepairStep, state: RepairState): Promise<void> 
   await repairStore.setStepState(step.id, state)
   const group = repairStore.groupOf(step.decayId)
   if (state === '已完成' && group && group.doneCount === group.totalCount) {
-    ElMessage.success('该病害全部工序完成，病害已回写为「已修复」')
+    ElMessage.success('该病害全部工序完成，病害已回写为「已修复」，排班保留为施工记录')
   } else {
     ElMessage.success(`工序状态已改为「${state}」`)
   }
@@ -210,7 +472,7 @@ async function onDrop(group: RepairGroup, target: RepairStep): Promise<void> {
   const targetIndex = ordered.indexOf(target.id)
   ordered.splice(targetIndex, 0, sourceId)
   await repairStore.reorder(group.decayId, ordered)
-  ElMessage.success('工序顺序已调整')
+  ElMessage.success('工序顺序已调整，受影响的未完成排班已作废并释放占用')
 }
 
 async function openScratch(): Promise<void> {
@@ -232,7 +494,7 @@ async function submitScratch(): Promise<void> {
   if (count === 0) {
     ElMessage.info('该殿宇下没有待编排的病害（可能已存在工序）')
   } else {
-    ElMessage.success(`已为待编排病害生成 ${count} 道工序，可逐条拖拽排序`)
+    ElMessage.success(`已为待编排病害生成 ${count} 道工序，可逐道排班或整组连续排班`)
   }
 }
 
@@ -241,8 +503,14 @@ function handleEmptyAction(): void {
   if (first) openStepDialog(first.id)
 }
 
+function batchRemaining(batchId: string): number {
+  return scheduleStore.remainingQty(batchId)
+}
+
 const stepNameOptions = REPAIR_STEP_NAMES
 const stateOptions = REPAIR_STATES
+const halfDayOptions = HALF_DAYS
+const halfDayLabel = HALF_DAY_LABEL
 </script>
 
 <template>
@@ -365,6 +633,9 @@ const stateOptions = REPAIR_STATES
             <el-tag :type="group.percent === 100 ? 'success' : 'info'" effect="plain" round>
               {{ group.doneCount }}/{{ group.totalCount }}（{{ group.percent }}%）
             </el-tag>
+            <el-button size="small" type="warning" plain :icon="Timer" @click="openGroupSchedule(group)">
+              整组排班
+            </el-button>
             <el-button size="small" type="danger" text :icon="Delete" @click="removeGroup(group)">清空</el-button>
           </div>
         </header>
@@ -403,6 +674,27 @@ const stateOptions = REPAIR_STATES
                   {{ step.state }}
                 </el-tag>
               </div>
+              <div class="step-card__schedule">
+                <template v-if="allocationView(step)">
+                  <el-tag
+                    size="small"
+                    :type="allocationView(step)!.tone"
+                    effect="dark"
+                    round
+                    class="step-card__schedule-tag"
+                  >
+                    <el-icon><Calendar /></el-icon>
+                    {{ allocationView(step)!.label }} · {{ allocationView(step)!.text }}
+                  </el-tag>
+                  <span v-if="allocationView(step)!.crewName" class="muted step-card__schedule-meta">
+                    {{ allocationView(step)!.crewName }} · {{ allocationView(step)!.batchText }}
+                  </span>
+                </template>
+                <span v-else class="muted step-card__schedule-unscheduled">
+                  <el-icon><Calendar /></el-icon>
+                  未排班
+                </span>
+              </div>
               <div class="step-card__fields">
                 <el-input
                   v-model="stepDrafts[step.id].material"
@@ -431,6 +723,16 @@ const stateOptions = REPAIR_STATES
               >
                 <el-option v-for="item in stateOptions" :key="item" :label="item" :value="item" />
               </el-select>
+              <el-button
+                v-if="step.state !== '已完成'"
+                size="small"
+                type="warning"
+                plain
+                :icon="Calendar"
+                @click="openSchedule(step)"
+              >
+                排班
+              </el-button>
               <el-button size="small" text :icon="Edit" @click="openStepDialog(group.decayId, step)">编辑</el-button>
               <el-button size="small" text type="danger" @click="removeStep(step)">删除</el-button>
             </div>
@@ -502,6 +804,159 @@ const stateOptions = REPAIR_STATES
       <template #footer>
         <el-button @click="scratchDialogVisible = false">取消</el-button>
         <el-button type="primary" @click="submitScratch">生成工序</el-button>
+      </template>
+    </el-dialog>
+
+    <el-dialog
+      v-model="scheduleDialogVisible"
+      :title="scheduleTarget ? `工序排班：${scheduleTarget.name}` : '工序排班'"
+      width="560px"
+      :close-on-click-modal="false"
+    >
+      <el-alert
+        type="info"
+        :closable="false"
+        show-icon
+        title="班组半天只接一道工序；材料容量不够或班组撞档时自动排队顺延，班组档期与材料批次两项都满足才占位。"
+        class="schedule-alert"
+      />
+      <el-form label-width="110px">
+        <el-form-item label="施工班组" required>
+          <el-select v-model="scheduleForm.crewId" class="full-width" placeholder="选择班组">
+            <el-option v-for="item in crewOptions" :key="item.value" :label="item.label" :value="item.value" />
+          </el-select>
+          <span v-if="crewOptions.length === 0" class="muted form-hint">
+            尚无在用班组，请先到「班组与材料」页建档
+          </span>
+        </el-form-item>
+        <el-form-item label="期望日期">
+          <el-date-picker
+            v-model="scheduleForm.startDate"
+            type="date"
+            value-format="YYYY-MM-DD"
+            class="full-width"
+          />
+        </el-form-item>
+        <el-form-item label="半天偏好">
+          <el-radio-group v-model="scheduleForm.preferredSlot">
+            <el-radio :value="null">不限</el-radio>
+            <el-radio v-for="item in halfDayOptions" :key="item" :value="item">{{ halfDayLabel[item] }}</el-radio>
+          </el-radio-group>
+        </el-form-item>
+        <el-form-item label="材料占用">
+          <el-radio-group v-model="scheduleForm.batchMode">
+            <el-radio value="auto">按工序材料自动匹配最早批次</el-radio>
+            <el-radio value="manual">指定批次</el-radio>
+            <el-radio value="none">不占材料</el-radio>
+          </el-radio-group>
+        </el-form-item>
+        <el-form-item v-if="scheduleForm.batchMode === 'manual'" label="材料批次" required>
+          <el-select v-model="scheduleForm.batchId" class="full-width" placeholder="选择批次">
+            <el-option
+              v-for="batch in matchingBatches"
+              :key="batch.id"
+              :label="`${batch.batchNo}（${batch.arriveDate} 到货，剩 ${batchRemaining(batch.id)} / ${batch.capacityQty}）`"
+              :value="batch.id"
+            />
+          </el-select>
+          <span v-if="matchingBatches.length === 0" class="muted form-hint">
+            没有与工序材料「{{ scheduleTarget?.material }}」同名的批次，可改自动匹配 / 不占材料，或先去建档
+          </span>
+        </el-form-item>
+        <el-form-item v-if="scheduleForm.batchMode !== 'none'" label="本次用量">
+          <el-input-number v-model="scheduleForm.qty" :min="1" :step="1" />
+          <span class="muted form-hint">
+            <template v-if="scheduleForm.batchMode === 'auto'">
+              自动选择到货后剩余容量 ≥ 用量的最早批次
+            </template>
+            <template v-else-if="scheduleTarget">
+              指定批次剩余 {{ scheduleForm.batchId ? batchRemaining(scheduleForm.batchId) : '—' }}
+            </template>
+          </span>
+        </el-form-item>
+      </el-form>
+      <p class="muted schedule-foot">
+        保存失败时本弹窗与填写内容会保留，可直接重试；事务自动回滚，不会留下半截档期或批次占用。
+      </p>
+      <template #footer>
+        <el-button
+          v-if="scheduleTarget && scheduleStore.latestAllocationOf(scheduleTarget.id)?.state === 'scheduled'"
+          type="danger"
+          plain
+          @click="scheduleTarget && cancelSchedule(scheduleTarget)"
+        >
+          取消排班并释放
+        </el-button>
+        <el-button @click="scheduleDialogVisible = false">取消</el-button>
+        <el-button type="primary" :loading="scheduling" @click="submitSchedule">占位排班</el-button>
+      </template>
+    </el-dialog>
+
+    <el-dialog
+      v-model="groupScheduleVisible"
+      :title="groupScheduleTarget ? `整组连续排班：${groupTitle(groupScheduleTarget)}` : '整组排班'"
+      width="640px"
+      :close-on-click-modal="false"
+    >
+      <el-alert
+        type="info"
+        :closable="false"
+        show-icon
+        title="按工序顺序由同一班组连续占用半天；材料批次按各工序材料自动匹配，容量不够则该工序排队顺延。任一道排不下则整组回滚。"
+        class="schedule-alert"
+      />
+      <el-form label-width="110px" class="group-form">
+        <el-form-item label="施工班组" required>
+          <el-select v-model="groupForm.crewId" class="full-width" placeholder="选择班组">
+            <el-option v-for="item in crewOptions" :key="item.value" :label="item.label" :value="item.value" />
+          </el-select>
+        </el-form-item>
+        <el-form-item label="起始日期">
+          <el-date-picker
+            v-model="groupForm.startDate"
+            type="date"
+            value-format="YYYY-MM-DD"
+            class="full-width"
+          />
+        </el-form-item>
+        <el-form-item label="起始半天">
+          <el-radio-group v-model="groupForm.preferredSlot">
+            <el-radio :value="null">不限</el-radio>
+            <el-radio v-for="item in halfDayOptions" :key="item" :value="item">{{ halfDayLabel[item] }}</el-radio>
+          </el-radio-group>
+        </el-form-item>
+      </el-form>
+
+      <el-table :data="groupDraftSteps" size="small" max-height="260">
+        <el-table-column label="序" width="50">
+          <template #default="{ row }">
+            <span class="mono">{{ row.seq }}</span>
+          </template>
+        </el-table-column>
+        <el-table-column label="工序" prop="name" width="90" />
+        <el-table-column label="材料（自动匹配同名批次）" prop="material" min-width="200" show-overflow-tooltip>
+          <template #default="{ row }">
+            <span v-if="row.material">{{ row.material }}</span>
+            <span v-else class="muted">未填材料</span>
+          </template>
+        </el-table-column>
+        <el-table-column label="用量（空=不占材料）" width="190">
+          <template #default="{ row }">
+            <el-input-number
+              v-model="groupQtyDrafts[row.id]"
+              :min="1"
+              :step="1"
+              size="small"
+              controls-position="right"
+              placeholder="不占"
+            />
+          </template>
+        </el-table-column>
+      </el-table>
+
+      <template #footer>
+        <el-button @click="groupScheduleVisible = false">取消</el-button>
+        <el-button type="primary" :loading="groupScheduling" @click="submitGroupSchedule">整组占位</el-button>
       </template>
     </el-dialog>
   </div>
@@ -647,6 +1102,50 @@ const stateOptions = REPAIR_STATES
   align-items: center;
   gap: 8px;
   margin-bottom: 6px;
+}
+
+.step-card__schedule {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 6px;
+  font-size: 12px;
+}
+
+.step-card__schedule-tag {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.step-card__schedule-meta {
+  font-size: 12px;
+}
+
+.step-card__schedule-unscheduled {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 12px;
+}
+
+.schedule-alert {
+  margin-bottom: 14px;
+}
+
+.form-hint {
+  margin-left: 10px;
+  font-size: 12px;
+}
+
+.schedule-foot {
+  margin: 4px 0 0;
+  font-size: 12px;
+}
+
+.group-form {
+  margin-top: 4px;
 }
 
 .step-card__fields {

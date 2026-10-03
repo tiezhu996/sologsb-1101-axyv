@@ -4,9 +4,11 @@ import type { Element } from '@/types/element'
 import type { PaintLayer } from '@/types/layer'
 import type { Decay } from '@/types/decay'
 import type { RepairStep } from '@/types/repair'
+import type { Crew, MaterialBatch } from '@/types/resource'
+import type { ScheduleAllocation } from '@/types/schedule'
 
 /** 本地结构版本号：新增/修改表结构时必须递增，并补充 upgrade 迁移 */
-export const DB_VERSION = 2
+export const DB_VERSION = 3
 
 /** 本地存储键名（localStorage 侧的少量元数据） */
 export const LS_KEYS = {
@@ -35,6 +37,9 @@ export interface BackupPayload {
   layers: PaintLayer[]
   decays: Decay[]
   repairSteps: RepairStep[]
+  crews: Crew[]
+  materialBatches: MaterialBatch[]
+  scheduleAllocations: ScheduleAllocation[]
 }
 
 export class MuralArchDatabase extends Dexie {
@@ -43,6 +48,9 @@ export class MuralArchDatabase extends Dexie {
   layers!: Table<PaintLayer, string>
   decays!: Table<Decay, string>
   repairSteps!: Table<RepairStep, string>
+  crews!: Table<Crew, string>
+  materialBatches!: Table<MaterialBatch, string>
+  scheduleAllocations!: Table<ScheduleAllocation, string>
 
   constructor() {
     super('gbmuralarch')
@@ -54,7 +62,7 @@ export class MuralArchDatabase extends Dexie {
       repairSteps: 'id, decayId, seq, state, updatedAt'
     })
     // v2：病害表补充 repairedAt 索引，工序表补充 name 索引
-    this.version(DB_VERSION)
+    this.version(2)
       .stores({
         halls: 'id, name, era, structureType, roofType, updatedAt',
         elements: 'id, hallId, position, status, updatedAt',
@@ -76,6 +84,17 @@ export class MuralArchDatabase extends Dexie {
             }
           })
       })
+    // v3：班组、材料批次、排班占用台账。新表无需回填，旧工序默认无日期（未排班）。
+    this.version(DB_VERSION).stores({
+      halls: 'id, name, era, structureType, roofType, updatedAt',
+      elements: 'id, hallId, position, status, updatedAt',
+      layers: 'id, elementId, level, patternName, pigment',
+      decays: 'id, layerId, type, severity, repaired, repairedAt, updatedAt',
+      repairSteps: 'id, decayId, seq, name, state, updatedAt',
+      crews: 'id, name, trade, archived, updatedAt',
+      materialBatches: 'id, materialName, arriveDate, updatedAt',
+      scheduleAllocations: 'id, stepId, decayId, crewId, batchId, state, updatedAt'
+    })
   }
 }
 
@@ -91,14 +110,26 @@ export function createId(prefix: string): string {
 export async function clearAllTables(): Promise<void> {
   await db.transaction(
     'rw',
-    [db.halls, db.elements, db.layers, db.decays, db.repairSteps],
+    [
+      db.halls,
+      db.elements,
+      db.layers,
+      db.decays,
+      db.repairSteps,
+      db.crews,
+      db.materialBatches,
+      db.scheduleAllocations
+    ],
     async () => {
       await Promise.all([
         db.halls.clear(),
         db.elements.clear(),
         db.layers.clear(),
         db.decays.clear(),
-        db.repairSteps.clear()
+        db.repairSteps.clear(),
+        db.crews.clear(),
+        db.materialBatches.clear(),
+        db.scheduleAllocations.clear()
       ])
     }
   )

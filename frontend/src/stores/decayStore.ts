@@ -2,6 +2,7 @@ import { defineStore } from 'pinia'
 import { computed, reactive, ref } from 'vue'
 import { db } from '@/utils/db'
 import { useIdbTable } from '@/hooks/useIdbTable'
+import { scheduleBus } from '@/utils/scheduleBus'
 import {
   createEmptyDecayFilter,
   type Decay,
@@ -175,27 +176,43 @@ export const useDecayStore = defineStore('decay', () => {
   }
 
   async function updateDecay(id: string, patch: Partial<Decay>): Promise<void> {
+    // 记录程度变更前的旧值：真正变化才作废旧排班，避免无谓释放
+    let severityChanged = false
+    if (patch.severity) {
+      const current = decays.value.find((decay) => decay.id === id)
+      severityChanged = !!current && current.severity !== patch.severity
+    }
     await decaysTable.update(id, patch)
+    if (severityChanged) scheduleBus.emit('decay:severity-changed', { decayIds: [id] })
   }
 
   async function removeDecay(id: string): Promise<void> {
-    await db.transaction('rw', [db.decays, db.repairSteps], async () => {
+    const stepIds = (await db.repairSteps.where('decayId').equals(id).toArray()).map((step) => step.id)
+    await db.transaction('rw', [db.decays, db.repairSteps, db.scheduleAllocations], async () => {
+      if (stepIds.length > 0) await db.scheduleAllocations.where('stepId').anyOf(stepIds).delete()
       await db.repairSteps.where('decayId').equals(id).delete()
       await db.decays.delete(id)
     })
     selectedIds.delete(id)
   }
 
-  /** 批量改严重程度（档案台批量操作） */
+  /** 批量改严重程度（档案台批量操作）：仅程度实际变化的病害会作废旧排班 */
   async function bulkSetSeverity(ids: string[], severity: Severity): Promise<number> {
     const now = Date.now()
+    const changedIds: string[] = []
     await db.decays
       .where('id')
       .anyOf(ids)
       .modify((decay) => {
-        decay.severity = severity
-        decay.updatedAt = now
+        if (decay.severity !== severity) {
+          decay.severity = severity
+          decay.updatedAt = now
+          changedIds.push(decay.id)
+        }
       })
+    if (changedIds.length > 0) {
+      scheduleBus.emit('decay:severity-changed', { decayIds: changedIds })
+    }
     return ids.length
   }
 

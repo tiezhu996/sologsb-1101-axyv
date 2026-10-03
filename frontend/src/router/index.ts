@@ -30,6 +30,12 @@ const routes: RouteRecordRaw[] = [
     meta: { title: '修复工序', icon: 'Tools' }
   },
   {
+    path: '/resources',
+    name: 'resources',
+    component: () => import('@/pages/Resources.vue'),
+    meta: { title: '班组与材料', icon: 'User' }
+  },
+  {
     path: '/backup',
     name: 'backup-view',
     component: () => import('@/pages/BackupView.vue'),

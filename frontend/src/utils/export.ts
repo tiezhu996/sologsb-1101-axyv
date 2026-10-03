@@ -15,13 +15,12 @@ export function validateBackup(input: unknown): { ok: boolean; errors: string[];
   }
   const obj = input as Partial<BackupPayload>
   if (obj.app !== 'gbmuralarch') errors.push('app 字段应为 gbmuralarch，文件来源不明')
-  const collections: Array<keyof Pick<BackupPayload, 'halls' | 'elements' | 'layers' | 'decays' | 'repairSteps'>> = [
-    'halls',
-    'elements',
-    'layers',
-    'decays',
-    'repairSteps'
-  ]
+  const collections: Array<
+    keyof Pick<
+      BackupPayload,
+      'halls' | 'elements' | 'layers' | 'decays' | 'repairSteps' | 'crews' | 'materialBatches'
+    >
+  > = ['halls', 'elements', 'layers', 'decays', 'repairSteps', 'crews', 'materialBatches']
   for (const key of collections) {
     if (!Array.isArray(obj[key])) errors.push(`${key} 字段缺失或不是数组`)
   }
@@ -34,20 +33,28 @@ export function validateBackup(input: unknown): { ok: boolean; errors: string[];
     elements: obj.elements ?? [],
     layers: obj.layers ?? [],
     decays: obj.decays ?? [],
-    repairSteps: obj.repairSteps ?? []
+    repairSteps: obj.repairSteps ?? [],
+    // v3 以前的备份没有班组 / 批次 / 排班台账，按空集合兼容导入
+    crews: obj.crews ?? [],
+    materialBatches: obj.materialBatches ?? [],
+    scheduleAllocations: Array.isArray(obj.scheduleAllocations) ? obj.scheduleAllocations : []
   }
   return { ok: true, errors, payload }
 }
 
 /** 组装当前本地数据的备份对象 */
 export async function buildBackupPayload(): Promise<BackupPayload> {
-  const [halls, elements, layers, decays, repairSteps] = await Promise.all([
-    db.halls.toArray(),
-    db.elements.toArray(),
-    db.layers.toArray(),
-    db.decays.toArray(),
-    db.repairSteps.toArray()
-  ])
+  const [halls, elements, layers, decays, repairSteps, crews, materialBatches, scheduleAllocations] =
+    await Promise.all([
+      db.halls.toArray(),
+      db.elements.toArray(),
+      db.layers.toArray(),
+      db.decays.toArray(),
+      db.repairSteps.toArray(),
+      db.crews.toArray(),
+      db.materialBatches.toArray(),
+      db.scheduleAllocations.toArray()
+    ])
   return {
     app: 'gbmuralarch',
     dbVersion: DB_VERSION,
@@ -56,7 +63,10 @@ export async function buildBackupPayload(): Promise<BackupPayload> {
     elements,
     layers,
     decays,
-    repairSteps
+    repairSteps,
+    crews,
+    materialBatches,
+    scheduleAllocations
   }
 }
 
@@ -81,7 +91,10 @@ export async function exportBackupJson(): Promise<{ fileName: string; counts: Re
       elements: payload.elements.length,
       layers: payload.layers.length,
       decays: payload.decays.length,
-      repairSteps: payload.repairSteps.length
+      repairSteps: payload.repairSteps.length,
+      crews: payload.crews.length,
+      materialBatches: payload.materialBatches.length,
+      scheduleAllocations: payload.scheduleAllocations.length
     }
   }
 }
@@ -104,13 +117,25 @@ export async function importBackup(
   if (overwrite) await clearAllTables()
   await db.transaction(
     'rw',
-    [db.halls, db.elements, db.layers, db.decays, db.repairSteps],
+    [
+      db.halls,
+      db.elements,
+      db.layers,
+      db.decays,
+      db.repairSteps,
+      db.crews,
+      db.materialBatches,
+      db.scheduleAllocations
+    ],
     async () => {
       await db.halls.bulkPut(payload.halls)
       await db.elements.bulkPut(payload.elements)
       await db.layers.bulkPut(payload.layers)
       await db.decays.bulkPut(payload.decays)
       await db.repairSteps.bulkPut(payload.repairSteps)
+      await db.crews.bulkPut(payload.crews)
+      await db.materialBatches.bulkPut(payload.materialBatches)
+      await db.scheduleAllocations.bulkPut(payload.scheduleAllocations)
     }
   )
   return {
@@ -118,7 +143,10 @@ export async function importBackup(
     elements: payload.elements.length,
     layers: payload.layers.length,
     decays: payload.decays.length,
-    repairSteps: payload.repairSteps.length
+    repairSteps: payload.repairSteps.length,
+    crews: payload.crews.length,
+    materialBatches: payload.materialBatches.length,
+    scheduleAllocations: payload.scheduleAllocations.length
   }
 }
 
@@ -128,6 +156,8 @@ export function remapIds(payload: BackupPayload): BackupPayload {
   const elementIdMap = new Map<string, string>()
   const layerIdMap = new Map<string, string>()
   const decayIdMap = new Map<string, string>()
+  const crewIdMap = new Map<string, string>()
+  const batchIdMap = new Map<string, string>()
 
   const halls = payload.halls.map((hall) => {
     const id = createId('hall')
@@ -149,12 +179,44 @@ export function remapIds(payload: BackupPayload): BackupPayload {
     decayIdMap.set(decay.id, id)
     return { ...decay, id, layerId: layerIdMap.get(decay.layerId) ?? decay.layerId }
   })
+  const crews = payload.crews.map((crew) => {
+    const id = createId('crew')
+    crewIdMap.set(crew.id, id)
+    return { ...crew, id }
+  })
+  const materialBatches = payload.materialBatches.map((batch) => {
+    const id = createId('batch')
+    batchIdMap.set(batch.id, id)
+    return { ...batch, id }
+  })
   const repairSteps = payload.repairSteps.map((step) => ({
     ...step,
     id: createId('step'),
     decayId: decayIdMap.get(step.decayId) ?? step.decayId
   }))
-  return { ...payload, halls, elements, layers, decays, repairSteps }
+  // 旧备份（v3 前）没有排班台账；有则随班组 / 批次 / 工序一起重映射
+  const oldStepIdByNew = new Map(
+    payload.repairSteps.map((step, index) => [step.id, repairSteps[index].id])
+  )
+  const scheduleAllocations = payload.scheduleAllocations.map((allocation) => ({
+    ...allocation,
+    id: createId('alloc'),
+    stepId: oldStepIdByNew.get(allocation.stepId) ?? createId('step'),
+    decayId: decayIdMap.get(allocation.decayId) ?? allocation.decayId,
+    crewId: crewIdMap.get(allocation.crewId) ?? allocation.crewId,
+    batchId: allocation.batchId ? batchIdMap.get(allocation.batchId) ?? allocation.batchId : null
+  }))
+  return {
+    ...payload,
+    halls,
+    elements,
+    layers,
+    decays,
+    repairSteps,
+    crews,
+    materialBatches,
+    scheduleAllocations
+  }
 }
 
 /** 生成演示样例数据，便于首次打开即可看到完整链路 */
@@ -164,10 +226,27 @@ export async function seedDemoData(): Promise<void> {
   const elementIds = [createId('elem'), createId('elem')]
   const layerIds = elementIds.map(() => createId('lay'))
   const decayIds = layerIds.map(() => createId('dec'))
+  const crewId = createId('crew')
+  const batchIdGlue = createId('batch')
+  const batchIdWater = createId('batch')
+
+  const dateA = '2026-10-08'
+  const dateB = '2026-10-08'
+  const stepIdClean = createId('step')
+  const stepIdGlue = createId('step')
 
   await db.transaction(
     'rw',
-    [db.halls, db.elements, db.layers, db.decays, db.repairSteps],
+    [
+      db.halls,
+      db.elements,
+      db.layers,
+      db.decays,
+      db.repairSteps,
+      db.crews,
+      db.materialBatches,
+      db.scheduleAllocations
+    ],
     async () => {
       await db.halls.put({
         id: hallId,
@@ -250,9 +329,42 @@ export async function seedDemoData(): Promise<void> {
           updatedAt: now
         }
       ])
+      await db.crews.bulkPut([
+        {
+          id: crewId,
+          name: '油工一组',
+          trade: '油工彩画',
+          contact: '李文博 / 13800000001',
+          archived: false,
+          createdAt: now,
+          updatedAt: now
+        }
+      ])
+      await db.materialBatches.bulkPut([
+        {
+          id: batchIdWater,
+          materialName: '软毛刷 + 去离子水',
+          batchNo: 'WATER-20261001',
+          arriveDate: '2026-10-01',
+          capacityQty: 1000,
+          note: '除尘用，按 ml 计',
+          createdAt: now,
+          updatedAt: now
+        },
+        {
+          id: batchIdGlue,
+          materialName: '鱼鳔胶（2% 明矾水调和）',
+          batchNo: 'GLUE-20261005',
+          arriveDate: '2026-10-05',
+          capacityQty: 300,
+          note: '回贴用，按 g 计',
+          createdAt: now,
+          updatedAt: now
+        }
+      ])
       await db.repairSteps.bulkPut([
         {
-          id: createId('step'),
+          id: stepIdClean,
           decayId: decayIds[0],
           seq: 1,
           name: '除尘',
@@ -263,7 +375,7 @@ export async function seedDemoData(): Promise<void> {
           updatedAt: now
         },
         {
-          id: createId('step'),
+          id: stepIdGlue,
           decayId: decayIds[0],
           seq: 2,
           name: '回贴',
@@ -274,6 +386,38 @@ export async function seedDemoData(): Promise<void> {
           updatedAt: now
         }
       ])
+      // 除尘已完成：占位为 done，档期与容量保留为施工记录
+      await db.scheduleAllocations.put({
+        id: createId('alloc'),
+        stepId: stepIdClean,
+        decayId: decayIds[0],
+        crewId,
+        date: dateA,
+        slot: 'AM',
+        batchId: batchIdWater,
+        qty: 120,
+        state: 'done',
+        voidReason: null,
+        voidedAt: null,
+        createdAt: now,
+        updatedAt: now
+      })
+      // 回贴待施工：占用同一天下午与鱼鳔胶批次容量
+      await db.scheduleAllocations.put({
+        id: createId('alloc'),
+        stepId: stepIdGlue,
+        decayId: decayIds[0],
+        crewId,
+        date: dateB,
+        slot: 'PM',
+        batchId: batchIdGlue,
+        qty: 80,
+        state: 'scheduled',
+        voidReason: null,
+        voidedAt: null,
+        createdAt: now,
+        updatedAt: now
+      })
     }
   )
 }
